@@ -12,32 +12,13 @@
 
 
 /*
- * 把 image_surface 畫到固定 800x600 window。
- *
- * base_scale:
- *     先把原圖等比例塞進 800x600
- *
- * zoom:
- *     使用者額外的縮放倍率
- *
- * final_scale:
- *     真正顯示倍率
+ * 計算圖片剛好 contain 在 Window 中的倍率。
  */
-static void render_image(
-    SDL_Window *window,
-    SDL_Surface *window_surface,
-    SDL_Surface *image_surface,
+static double get_base_scale(
     int image_width,
-    int image_height,
-    double zoom
+    int image_height
 )
 {
-    /*
-     * --------------------------------
-     * 1. 計算 contain 基礎倍率
-     * --------------------------------
-     */
-
     double scale_x =
         (double)WINDOW_WIDTH /
         (double)image_width;
@@ -46,53 +27,69 @@ static void render_image(
         (double)WINDOW_HEIGHT /
         (double)image_height;
 
+    return scale_x < scale_y
+        ? scale_x
+        : scale_y;
+}
+
+
+/*
+ * Render image。
+ *
+ * image_x / image_y：
+ *     圖片左上角在 Window 中的位置。
+ *
+ * zoom：
+ *     相對於 contain size 的縮放倍率。
+ */
+static void render_image(
+    SDL_Window *window,
+    SDL_Surface *window_surface,
+    SDL_Surface *image_surface,
+    int image_width,
+    int image_height,
+    double zoom,
+    double image_x,
+    double image_y
+)
+{
     double base_scale =
-        scale_x < scale_y
-            ? scale_x
-            : scale_y;
-
-
-    /*
-     * --------------------------------
-     * 2. 加入使用者 zoom
-     * --------------------------------
-     */
+        get_base_scale(
+            image_width,
+            image_height
+        );
 
     double final_scale =
         base_scale * zoom;
 
 
     int scaled_width =
-        (int)(image_width * final_scale);
+        (int)(image_width *
+              final_scale);
 
     int scaled_height =
-        (int)(image_height * final_scale);
+        (int)(image_height *
+              final_scale);
 
-
-    /*
-     * --------------------------------
-     * 3. 圖片保持在視窗中心
-     * --------------------------------
-     */
 
     SDL_Rect dst_rect;
+
+    /*
+     * 現在不再自動置中。
+     *
+     * 圖片位置完全由 viewport state
+     * image_x/image_y 控制。
+     */
+    dst_rect.x = (int)image_x;
+    dst_rect.y = (int)image_y;
 
     dst_rect.w = scaled_width;
     dst_rect.h = scaled_height;
 
-    dst_rect.x =
-        (WINDOW_WIDTH - scaled_width) / 2;
-
-    dst_rect.y =
-        (WINDOW_HEIGHT - scaled_height) / 2;
-
 
     /*
-     * --------------------------------
-     * 4. 清除上一幀
-     * --------------------------------
+     * 清除上一幀。
      */
-
     Uint32 background =
         SDL_MapRGB(
             window_surface->format,
@@ -109,11 +106,8 @@ static void render_image(
 
 
     /*
-     * --------------------------------
-     * 5. Scale + Blit
-     * --------------------------------
+     * Scale + Blit
      */
-
     if (SDL_BlitScaled(
             image_surface,
             NULL,
@@ -126,12 +120,6 @@ static void render_image(
                 SDL_GetError());
     }
 
-
-    /*
-     * --------------------------------
-     * 6. Present
-     * --------------------------------
-     */
 
     SDL_UpdateWindowSurface(window);
 }
@@ -151,9 +139,11 @@ int main(int argc, char *argv[])
 
     if (argc == 2) {
 
-        input = fopen(argv[1], "rb");
+        input =
+            fopen(argv[1], "rb");
 
         if (!input) {
+
             fprintf(stderr,
                     "Failed to open file: %s\n",
                     argv[1]);
@@ -183,12 +173,18 @@ int main(int argc, char *argv[])
      */
 
     char magic[3];
+
     int width;
     int height;
     int maxval;
 
 
-    if (fscanf(input, "%2s", magic) != 1) {
+    if (fscanf(
+            input,
+            "%2s",
+            magic
+        ) != 1) {
+
         fprintf(stderr,
                 "Failed to read PPM magic\n");
 
@@ -196,7 +192,11 @@ int main(int argc, char *argv[])
     }
 
 
-    if (strcmp(magic, "P6") != 0) {
+    if (strcmp(
+            magic,
+            "P6"
+        ) != 0) {
+
         fprintf(stderr,
                 "Only P6 PPM is supported\n");
 
@@ -233,9 +233,7 @@ int main(int argc, char *argv[])
 
 
     /*
-     * Consume whitespace after:
-     *
-     * 255\n
+     * Consume newline after 255.
      */
     fgetc(input);
 
@@ -246,7 +244,9 @@ int main(int argc, char *argv[])
      * ================================
      */
 
-    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+    if (SDL_Init(
+            SDL_INIT_VIDEO
+        ) != 0) {
 
         fprintf(stderr,
                 "SDL_Init: %s\n",
@@ -281,7 +281,7 @@ int main(int argc, char *argv[])
 
     /*
      * ================================
-     * 4. 原始圖片 Surface
+     * 4. Image Surface
      * ================================
      */
 
@@ -310,11 +310,12 @@ int main(int argc, char *argv[])
 
     /*
      * ================================
-     * 5. Decode PPM RGB
+     * 5. Decode PPM
      * ================================
      */
 
-    if (SDL_MUSTLOCK(image_surface)) {
+    if (SDL_MUSTLOCK(
+            image_surface)) {
 
         if (SDL_LockSurface(
                 image_surface
@@ -324,8 +325,12 @@ int main(int argc, char *argv[])
                     "SDL_LockSurface: %s\n",
                     SDL_GetError());
 
-            SDL_FreeSurface(image_surface);
-            SDL_DestroyWindow(window);
+            SDL_FreeSurface(
+                image_surface);
+
+            SDL_DestroyWindow(
+                window);
+
             SDL_Quit();
 
             goto fail_input;
@@ -333,14 +338,20 @@ int main(int argc, char *argv[])
     }
 
 
-    for (int y = 0; y < height; ++y) {
+    for (int y = 0;
+         y < height;
+         ++y) {
 
         Uint8 *row =
-            (Uint8 *)image_surface->pixels +
-            y * image_surface->pitch;
+            (Uint8 *)
+                image_surface->pixels +
+            y *
+                image_surface->pitch;
 
 
-        for (int x = 0; x < width; ++x) {
+        for (int x = 0;
+             x < width;
+             ++x) {
 
             int r = fgetc(input);
             int g = fgetc(input);
@@ -388,19 +399,20 @@ int main(int argc, char *argv[])
     }
 
 
-    if (SDL_MUSTLOCK(image_surface)) {
-        SDL_UnlockSurface(image_surface);
+    if (SDL_MUSTLOCK(
+            image_surface)) {
+
+        SDL_UnlockSurface(
+            image_surface);
     }
 
 
-    /*
-     * PPM 已經完全讀完。
-     */
     if (should_close_input) {
 
         fclose(input);
 
         input = NULL;
+
         should_close_input = 0;
     }
 
@@ -412,7 +424,8 @@ int main(int argc, char *argv[])
      */
 
     SDL_Surface *window_surface =
-        SDL_GetWindowSurface(window);
+        SDL_GetWindowSurface(
+            window);
 
 
     if (!window_surface) {
@@ -421,8 +434,12 @@ int main(int argc, char *argv[])
                 "SDL_GetWindowSurface: %s\n",
                 SDL_GetError());
 
-        SDL_FreeSurface(image_surface);
-        SDL_DestroyWindow(window);
+        SDL_FreeSurface(
+            image_surface);
+
+        SDL_DestroyWindow(
+            window);
+
         SDL_Quit();
 
         return 1;
@@ -431,36 +448,62 @@ int main(int argc, char *argv[])
 
     /*
      * ================================
-     * 7. Zoom state
+     * 7. Viewport State
      * ================================
-     *
-     * zoom = 1.0
-     *
-     * 表示：
-     *
-     * 「剛好 contain 在 800x600」
      */
 
     double zoom = 1.0;
 
 
     /*
-     * 第一次 Render。
+     * zoom = 1.0 時：
+     *
+     * 圖片先 contain 到 800x600。
      */
+    double base_scale =
+        get_base_scale(
+            width,
+            height
+        );
 
+
+    double display_width =
+        width * base_scale;
+
+    double display_height =
+        height * base_scale;
+
+
+    /*
+     * 初始圖片置中。
+     */
+    double image_x =
+        (WINDOW_WIDTH -
+         display_width) / 2.0;
+
+    double image_y =
+        (WINDOW_HEIGHT -
+         display_height) / 2.0;
+
+
+    /*
+     * 第一次 render。
+     */
     render_image(
         window,
         window_surface,
         image_surface,
         width,
         height,
-        zoom
+        zoom,
+        image_x,
+        image_y
     );
 
 
     /*
      * ================================
-     * 8. Event loop
+     * 8. Event Loop
      * ================================
      */
 
@@ -472,20 +515,19 @@ int main(int argc, char *argv[])
         SDL_Event event;
 
 
-        while (SDL_PollEvent(&event)) {
+        while (SDL_PollEvent(
+                &event)) {
 
-            /*
-             * 關閉 Window
-             */
-            if (event.type == SDL_QUIT) {
+
+            if (event.type ==
+                SDL_QUIT) {
+
                 running = 0;
             }
 
 
-            /*
-             * ESC 離開
-             */
-            if (event.type == SDL_KEYDOWN &&
+            if (event.type ==
+                    SDL_KEYDOWN &&
                 event.key.keysym.sym ==
                     SDLK_ESCAPE) {
 
@@ -495,57 +537,160 @@ int main(int argc, char *argv[])
 
             /*
              * ========================
-             * Mouse Wheel Zoom
+             * Cursor-centered Zoom
              * ========================
              */
-
             if (event.type ==
                 SDL_MOUSEWHEEL) {
 
                 /*
-                 * wheel.y > 0
-                 *
-                 * 滾輪向上
-                 * → 放大
+                 * --------------------
+                 * 1. 取得 mouse
+                 * --------------------
                  */
 
-                if (event.wheel.y > 0) {
+                int mouse_x;
+                int mouse_y;
 
-                    zoom *= ZOOM_STEP;
-
-
-                    if (zoom > MAX_ZOOM) {
-                        zoom = MAX_ZOOM;
-                    }
-                }
-
-
-                /*
-                 * wheel.y < 0
-                 *
-                 * 滾輪向下
-                 * → 縮小
-                 */
-
-                else if (event.wheel.y < 0) {
-
-                    zoom /= ZOOM_STEP;
-
-
-                    if (zoom < MIN_ZOOM) {
-                        zoom = MIN_ZOOM;
-                    }
-                }
-
-
-                printf(
-                    "zoom = %.2f\n",
-                    zoom
+                SDL_GetMouseState(
+                    &mouse_x,
+                    &mouse_y
                 );
 
 
                 /*
-                 * zoom 改變後重新畫圖。
+                 * --------------------
+                 * 2. old scale
+                 * --------------------
+                 */
+
+                double old_scale =
+                    base_scale * zoom;
+
+
+                /*
+                 * --------------------
+                 * 3. Window coordinate
+                 *    →
+                 *    Image coordinate
+                 * --------------------
+                 *
+                 * 算滑鼠現在指到
+                 * 原始圖片哪一點。
+                 */
+
+                double image_pixel_x =
+                    (mouse_x -
+                     image_x) /
+                    old_scale;
+
+                double image_pixel_y =
+                    (mouse_y -
+                     image_y) /
+                    old_scale;
+
+
+                /*
+                 * --------------------
+                 * 4. 改 zoom
+                 * --------------------
+                 */
+
+                int wheel_y =
+                    event.wheel.y;
+
+
+                /*
+                 * 某些系統會回報 flipped。
+                 */
+                if (event.wheel.direction ==
+                    SDL_MOUSEWHEEL_FLIPPED) {
+
+                    wheel_y =
+                        -wheel_y;
+                }
+
+
+                if (wheel_y > 0) {
+
+                    zoom *=
+                        ZOOM_STEP;
+
+                    if (zoom >
+                        MAX_ZOOM) {
+
+                        zoom =
+                            MAX_ZOOM;
+                    }
+                }
+
+
+                else if (wheel_y < 0) {
+
+                    zoom /=
+                        ZOOM_STEP;
+
+                    if (zoom <
+                        MIN_ZOOM) {
+
+                        zoom =
+                            MIN_ZOOM;
+                    }
+                }
+
+
+                /*
+                 * --------------------
+                 * 5. new scale
+                 * --------------------
+                 */
+
+                double new_scale =
+                    base_scale *
+                    zoom;
+
+
+                /*
+                 * --------------------
+                 * 6. Fix anchor
+                 * --------------------
+                 *
+                 * 保證：
+                 *
+                 * image_pixel_x/y
+                 *
+                 * 放大後仍然出現在
+                 *
+                 * mouse_x/y
+                 */
+
+                image_x =
+                    mouse_x -
+                    image_pixel_x *
+                    new_scale;
+
+                image_y =
+                    mouse_y -
+                    image_pixel_y *
+                    new_scale;
+
+
+                printf(
+                    "zoom = %.2f "
+                    "mouse=(%d,%d) "
+                    "image=(%.1f,%.1f)\n",
+                    zoom,
+                    mouse_x,
+                    mouse_y,
+                    image_pixel_x,
+                    image_pixel_y
+                );
+
+
+                /*
+                 * --------------------
+                 * 7. Render
+                 * --------------------
                  */
 
                 render_image(
@@ -554,7 +699,9 @@ int main(int argc, char *argv[])
                     image_surface,
                     width,
                     height,
-                    zoom
+                    zoom,
+                    image_x,
+                    image_y
                 );
             }
         }
@@ -570,9 +717,11 @@ int main(int argc, char *argv[])
      * ================================
      */
 
-    SDL_FreeSurface(image_surface);
+    SDL_FreeSurface(
+        image_surface);
 
-    SDL_DestroyWindow(window);
+    SDL_DestroyWindow(
+        window);
 
     SDL_Quit();
 
