@@ -34,6 +34,72 @@ static double get_base_scale(
 
 
 /*
+ * 限制圖片可移動的範圍。
+ *
+ * 規則：
+ * 1. 某一軸的圖片尺寸 <= Window 時，該軸固定置中。
+ * 2. 某一軸的圖片尺寸 > Window 時，只允許在
+ *    [WindowSize - ImageSize, 0] 範圍內移動。
+ *
+ * 這可以避免把圖片拖到完全離開視窗、露出大片黑邊。
+ */
+static void clamp_image_position(
+    double *image_x,
+    double *image_y,
+    int image_width,
+    int image_height,
+    double base_scale,
+    double zoom
+)
+{
+    double final_scale =
+        base_scale * zoom;
+
+    double scaled_width =
+        image_width * final_scale;
+
+    double scaled_height =
+        image_height * final_scale;
+
+
+    /* X 軸 */
+    if (scaled_width <= WINDOW_WIDTH) {
+        *image_x =
+            (WINDOW_WIDTH - scaled_width) / 2.0;
+    } else {
+        double min_x =
+            WINDOW_WIDTH - scaled_width;
+
+        if (*image_x > 0.0) {
+            *image_x = 0.0;
+        }
+
+        if (*image_x < min_x) {
+            *image_x = min_x;
+        }
+    }
+
+
+    /* Y 軸 */
+    if (scaled_height <= WINDOW_HEIGHT) {
+        *image_y =
+            (WINDOW_HEIGHT - scaled_height) / 2.0;
+    } else {
+        double min_y =
+            WINDOW_HEIGHT - scaled_height;
+
+        if (*image_y > 0.0) {
+            *image_y = 0.0;
+        }
+
+        if (*image_y < min_y) {
+            *image_y = min_y;
+        }
+    }
+}
+
+
+/*
  * Render image。
  *
  * image_x / image_y：
@@ -454,6 +520,16 @@ int main(int argc, char *argv[])
 
     double zoom = 1.0;
 
+    /*
+     * Pan / drag state。
+     *
+     * dragging == 1：
+     *     左鍵目前正在拖曳圖片。
+     *
+     * 注意：只有 zoom > 1.0 時才會進入 dragging。
+     */
+    int dragging = 0;
+
 
     /*
      * zoom = 1.0 時：
@@ -532,6 +608,76 @@ int main(int argc, char *argv[])
                     SDLK_ESCAPE) {
 
                 running = 0;
+            }
+
+
+            /*
+             * ========================
+             * Mouse Drag / Pan
+             * ========================
+             *
+             * 只有 zoom > 1.0 才允許拖曳。
+             */
+
+            /* 左鍵按下：開始拖曳 */
+            if (event.type ==
+                    SDL_MOUSEBUTTONDOWN &&
+                event.button.button ==
+                    SDL_BUTTON_LEFT) {
+
+                if (zoom > 1.000001) {
+                    dragging = 1;
+                }
+            }
+
+
+            /* 左鍵放開：結束拖曳 */
+            if (event.type ==
+                    SDL_MOUSEBUTTONUP &&
+                event.button.button ==
+                    SDL_BUTTON_LEFT) {
+
+                dragging = 0;
+            }
+
+
+            /*
+             * 滑鼠移動時，SDL_MOUSEMOTION 直接提供
+             * 相對位移 xrel / yrel。
+             */
+            if (event.type ==
+                    SDL_MOUSEMOTION &&
+                dragging &&
+                zoom > 1.000001) {
+
+                image_x +=
+                    event.motion.xrel;
+
+                image_y +=
+                    event.motion.yrel;
+
+
+                /* 防止拖出合法範圍。 */
+                clamp_image_position(
+                    &image_x,
+                    &image_y,
+                    width,
+                    height,
+                    base_scale,
+                    zoom
+                );
+
+
+                render_image(
+                    window,
+                    window_surface,
+                    image_surface,
+                    width,
+                    height,
+                    zoom,
+                    image_x,
+                    image_y
+                );
             }
 
 
@@ -673,6 +819,26 @@ int main(int argc, char *argv[])
                     mouse_y -
                     image_pixel_y *
                     new_scale;
+
+
+                /*
+                 * zoom <= 1 時不允許 pan；clamp 也會
+                 * 自動把不足 Window 大小的軸重新置中。
+                 *
+                 * zoom > 1 時則限制在合法可拖曳範圍。
+                 */
+                if (zoom <= 1.000001) {
+                    dragging = 0;
+                }
+
+                clamp_image_position(
+                    &image_x,
+                    &image_y,
+                    width,
+                    height,
+                    base_scale,
+                    zoom
+                );
 
 
                 printf(
