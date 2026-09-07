@@ -100,6 +100,108 @@ static void clamp_image_position(
 
 
 /*
+ * 將 SDL_Surface 順時針旋轉 90 度。
+ *
+ * 原圖尺寸：W x H
+ * 新圖尺寸：H x W
+ *
+ * 座標映射：
+ *
+ *     src(x, y)
+ *         ->
+ *     dst(H - 1 - y, x)
+ *
+ * 此程式目前的 image_surface 固定是 32-bit ARGB8888，
+ * 因此可以用 Uint32 逐 pixel 複製。
+ */
+static SDL_Surface *rotate_surface_90_clockwise(
+    SDL_Surface *src
+)
+{
+    int src_width = src->w;
+    int src_height = src->h;
+
+    SDL_Surface *dst =
+        SDL_CreateRGBSurfaceWithFormat(
+            0,
+            src_height,   /* new width  = old height */
+            src_width,    /* new height = old width  */
+            32,
+            src->format->format
+        );
+
+    if (!dst) {
+        fprintf(stderr,
+                "rotate: SDL_CreateRGBSurfaceWithFormat: %s\n",
+                SDL_GetError());
+        return NULL;
+    }
+
+    int src_locked = 0;
+    int dst_locked = 0;
+
+    if (SDL_MUSTLOCK(src)) {
+        if (SDL_LockSurface(src) != 0) {
+            fprintf(stderr,
+                    "rotate: SDL_LockSurface(src): %s\n",
+                    SDL_GetError());
+            SDL_FreeSurface(dst);
+            return NULL;
+        }
+        src_locked = 1;
+    }
+
+    if (SDL_MUSTLOCK(dst)) {
+        if (SDL_LockSurface(dst) != 0) {
+            fprintf(stderr,
+                    "rotate: SDL_LockSurface(dst): %s\n",
+                    SDL_GetError());
+
+            if (src_locked) {
+                SDL_UnlockSurface(src);
+            }
+
+            SDL_FreeSurface(dst);
+            return NULL;
+        }
+        dst_locked = 1;
+    }
+
+    for (int y = 0; y < src_height; ++y) {
+
+        Uint32 *src_row =
+            (Uint32 *)((Uint8 *)src->pixels +
+                       y * src->pitch);
+
+        for (int x = 0; x < src_width; ++x) {
+
+            int dst_x =
+                src_height - 1 - y;
+
+            int dst_y = x;
+
+            Uint32 *dst_row =
+                (Uint32 *)((Uint8 *)dst->pixels +
+                           dst_y * dst->pitch);
+
+            dst_row[dst_x] =
+                src_row[x];
+        }
+    }
+
+    if (dst_locked) {
+        SDL_UnlockSurface(dst);
+    }
+
+    if (src_locked) {
+        SDL_UnlockSurface(src);
+    }
+
+    return dst;
+}
+
+
+/*
  * Render image。
  *
  * image_x / image_y：
@@ -608,6 +710,100 @@ int main(int argc, char *argv[])
                     SDLK_ESCAPE) {
 
                 running = 0;
+            }
+
+
+            /*
+             * ========================
+             * Rotate 90 degrees clockwise
+             * ========================
+             *
+             * 按 R：
+             * 1. 建立一張旋轉後的新 Surface。
+             * 2. 釋放舊 Surface。
+             * 3. width / height 交換。
+             * 4. zoom 重設成 1.0。
+             * 5. 重新計算 contain scale 並置中。
+             */
+            if (event.type ==
+                    SDL_KEYDOWN &&
+                event.key.keysym.sym ==
+                    SDLK_r &&
+                event.key.repeat == 0) {
+
+                SDL_Surface *rotated_surface =
+                    rotate_surface_90_clockwise(
+                        image_surface
+                    );
+
+                if (rotated_surface) {
+
+                    SDL_FreeSurface(
+                        image_surface
+                    );
+
+                    image_surface =
+                        rotated_surface;
+
+
+                    /*
+                     * 旋轉 90 度後，圖片尺寸互換。
+                     *
+                     * old: W x H
+                     * new: H x W
+                     */
+                    int old_width = width;
+                    width = height;
+                    height = old_width;
+
+
+                    /*
+                     * 旋轉後重新 fit 到 800x600。
+                     * 同時取消舊的 pan / zoom 狀態，
+                     * 避免舊座標套到新的方向。
+                     */
+                    zoom = 1.0;
+                    dragging = 0;
+
+                    base_scale =
+                        get_base_scale(
+                            width,
+                            height
+                        );
+
+                    display_width =
+                        width * base_scale;
+
+                    display_height =
+                        height * base_scale;
+
+                    image_x =
+                        (WINDOW_WIDTH -
+                         display_width) / 2.0;
+
+                    image_y =
+                        (WINDOW_HEIGHT -
+                         display_height) / 2.0;
+
+
+                    printf(
+                        "rotate 90 CW: %d x %d\n",
+                        width,
+                        height
+                    );
+
+
+                    render_image(
+                        window,
+                        window_surface,
+                        image_surface,
+                        width,
+                        height,
+                        zoom,
+                        image_x,
+                        image_y
+                    );
+                }
             }
 
 
