@@ -19,7 +19,7 @@ or
 
 - mouse scroll:change zoom
 - left and right mouse: move the img view
-
+- 'r' key: rotate img clockwise 90 degree
 
 
 ## convert png to ppm command
