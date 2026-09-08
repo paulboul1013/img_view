@@ -11,6 +11,94 @@
 #define MAX_ZOOM  10.0
 
 
+typedef enum {
+    IMAGE_FORMAT_UNKNOWN = 0,
+    IMAGE_FORMAT_PPM_P6,
+    IMAGE_FORMAT_PNG
+} ImageFormat;
+
+
+/*
+ * Stage 1: 只辨識輸入圖片格式。
+ *
+ * 為了同時支援：
+ *     ./main image.ppm
+ *     ./main < image.ppm
+ *     ./main image.png
+ *     ./main < image.png
+ *
+ * 這裡不使用 fseek()/rewind()，因為 stdin 可能來自 pipe。
+ * 我們先讀前 2 bytes：
+ *
+ *     PPM P6 : 'P' '6'
+ *     PNG    : 0x89 'P' ...
+ *
+ * 若是 PPM，這兩個 bytes 就視為已經消耗掉 magic number，
+ * main() 接著直接讀 width / height / maxval。
+ *
+ * 若可能是 PNG，再補讀剩下 6 bytes 驗證完整 8-byte signature。
+ */
+static int detect_image_format(
+    FILE *input,
+    ImageFormat *format
+)
+{
+    static const unsigned char png_signature[8] = {
+        0x89, 0x50, 0x4E, 0x47,
+        0x0D, 0x0A, 0x1A, 0x0A
+    };
+
+    int b0 = fgetc(input);
+    int b1 = fgetc(input);
+
+    if (b0 == EOF || b1 == EOF) {
+        return 0;
+    }
+
+    /* PPM binary pixmap magic number: P6 */
+    if (b0 == 'P' && b1 == '6') {
+        *format = IMAGE_FORMAT_PPM_P6;
+        return 1;
+    }
+
+    /*
+     * PNG 的前兩個 bytes 必須是 0x89 0x50。
+     * 只有符合時才需要繼續讀剩下的 6 bytes。
+     */
+    if ((unsigned char)b0 == 0x89 &&
+        (unsigned char)b1 == 0x50) {
+
+        unsigned char signature[8];
+
+        signature[0] = (unsigned char)b0;
+        signature[1] = (unsigned char)b1;
+
+        if (fread(
+                signature + 2,
+                1,
+                6,
+                input
+            ) != 6) {
+
+            return 0;
+        }
+
+        if (memcmp(
+                signature,
+                png_signature,
+                sizeof(png_signature)
+            ) == 0) {
+
+            *format = IMAGE_FORMAT_PNG;
+            return 1;
+        }
+    }
+
+    *format = IMAGE_FORMAT_UNKNOWN;
+    return 1;
+}
+
+
 /*
  * 計算圖片剛好 contain 在 Window 中的倍率。
  */
@@ -326,7 +414,11 @@ int main(int argc, char *argv[])
         fprintf(stderr,
                 "Usage:\n"
                 "  %s < image.ppm\n"
-                "  %s image.ppm\n",
+                "  %s image.ppm\n"
+                "  %s < image.png    (Stage 1 detection only)\n"
+                "  %s image.png      (Stage 1 detection only)\n",
+                argv[0],
+                argv[0],
                 argv[0],
                 argv[0]);
 
@@ -336,40 +428,50 @@ int main(int argc, char *argv[])
 
     /*
      * ================================
-     * 2. Parse PPM
+     * 2. Stage 1 - Detect image format
      * ================================
      */
 
-    char magic[3];
+    ImageFormat format = IMAGE_FORMAT_UNKNOWN;
+
+    if (!detect_image_format(input, &format)) {
+        fprintf(stderr,
+                "Failed to read image signature\n");
+        goto fail_input;
+    }
+
+    if (format == IMAGE_FORMAT_PNG) {
+        printf("PNG detected\n");
+        printf("Stage 1 complete: PNG decoding is not implemented yet.\n");
+
+        if (should_close_input) {
+            fclose(input);
+        }
+
+        return 0;
+    }
+
+    if (format != IMAGE_FORMAT_PPM_P6) {
+        fprintf(stderr,
+                "Unsupported image format\n");
+        goto fail_input;
+    }
+
+    printf("PPM P6 detected\n");
+
+
+    /*
+     * ================================
+     * 3. Parse remaining PPM header
+     * ================================
+     *
+     * detect_image_format() 已經吃掉了 'P' '6'，
+     * 因此這裡直接從 width / height 開始讀。
+     */
 
     int width;
     int height;
     int maxval;
-
-
-    if (fscanf(
-            input,
-            "%2s",
-            magic
-        ) != 1) {
-
-        fprintf(stderr,
-                "Failed to read PPM magic\n");
-
-        goto fail_input;
-    }
-
-
-    if (strcmp(
-            magic,
-            "P6"
-        ) != 0) {
-
-        fprintf(stderr,
-                "Only P6 PPM is supported\n");
-
-        goto fail_input;
-    }
 
 
     if (fscanf(
@@ -426,7 +528,7 @@ int main(int argc, char *argv[])
 
     SDL_Window *window =
         SDL_CreateWindow(
-            "PPM Viewer",
+            "Image Viewer",
             SDL_WINDOWPOS_CENTERED,
             SDL_WINDOWPOS_CENTERED,
             WINDOW_WIDTH,
