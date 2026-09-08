@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 #define WINDOW_WIDTH  800
 #define WINDOW_HEIGHT 600
@@ -16,6 +17,30 @@ typedef enum {
     IMAGE_FORMAT_PPM_P6,
     IMAGE_FORMAT_PNG
 } ImageFormat;
+
+
+/*
+ * Stage 3: IHDR 的 13-byte metadata。
+ *
+ * PNG IHDR data layout:
+ *
+ *     4 bytes  width
+ *     4 bytes  height
+ *     1 byte   bit depth
+ *     1 byte   color type
+ *     1 byte   compression method
+ *     1 byte   filter method
+ *     1 byte   interlace method
+ */
+typedef struct {
+    uint32_t width;
+    uint32_t height;
+    uint8_t bit_depth;
+    uint8_t color_type;
+    uint8_t compression_method;
+    uint8_t filter_method;
+    uint8_t interlace_method;
+} PNGHeader;
 
 
 /*
@@ -98,6 +123,340 @@ static int detect_image_format(
     return 1;
 }
 
+
+
+/*
+ * Stage 2 helper:
+ * PNG 中的 4-byte integer 使用 big-endian（高位 byte 在前）。
+ *
+ * 例如：
+ *     00 00 00 0D
+ *          ->
+ *     13
+ */
+static int read_u32_be(
+    FILE *input,
+    uint32_t *value
+)
+{
+    unsigned char b[4];
+
+    if (fread(b, 1, 4, input) != 4) {
+        return 0;
+    }
+
+    *value =
+        ((uint32_t)b[0] << 24) |
+        ((uint32_t)b[1] << 16) |
+        ((uint32_t)b[2] << 8)  |
+        ((uint32_t)b[3]);
+
+    return 1;
+}
+
+
+/*
+ * 跳過目前 Stage 2 還不解析的 chunk data。
+ *
+ * 不使用 fseek()，因為 input 可能是：
+ *     ./main < image.png
+ * 或 pipe，這些 stream 不一定可以 seek。
+ */
+
+/*
+ * 從 memory 中的 4 bytes 讀 big-endian uint32_t。
+ *
+ * Stage 2 的 read_u32_be() 是從 FILE 讀；
+ * Stage 3 解析 IHDR 時，13 bytes 已經先讀進 memory，
+ * 所以需要 memory 版本。
+ */
+static uint32_t u32_be_from_bytes(
+    const unsigned char *b
+)
+{
+    return
+        ((uint32_t)b[0] << 24) |
+        ((uint32_t)b[1] << 16) |
+        ((uint32_t)b[2] << 8)  |
+        ((uint32_t)b[3]);
+}
+
+
+/*
+ * 把 IHDR 的固定 13 bytes 拆成 PNGHeader。
+ */
+static int parse_png_ihdr(
+    const unsigned char *data,
+    uint32_t length,
+    PNGHeader *header
+)
+{
+    if (length != 13) {
+        fprintf(stderr,
+                "PNG: IHDR length must be 13, got %u\n",
+                (unsigned)length);
+        return 0;
+    }
+
+    header->width =
+        u32_be_from_bytes(data + 0);
+
+    header->height =
+        u32_be_from_bytes(data + 4);
+
+    header->bit_depth = data[8];
+    header->color_type = data[9];
+    header->compression_method = data[10];
+    header->filter_method = data[11];
+    header->interlace_method = data[12];
+
+    if (header->width == 0 ||
+        header->height == 0) {
+        fprintf(stderr,
+                "PNG: width and height must be non-zero\n");
+        return 0;
+    }
+
+    return 1;
+}
+
+
+static const char *png_color_type_name(
+    uint8_t color_type
+)
+{
+    switch (color_type) {
+        case 0:
+            return "Grayscale";
+
+        case 2:
+            return "Truecolor RGB";
+
+        case 3:
+            return "Indexed-color / Palette";
+
+        case 4:
+            return "Grayscale + Alpha";
+
+        case 6:
+            return "Truecolor RGBA";
+
+        default:
+            return "Invalid / Unknown";
+    }
+}
+
+
+static void print_png_ihdr(
+    const PNGHeader *header
+)
+{
+    printf("\nIHDR metadata\n");
+    printf("--------------------------------\n");
+    printf("Width       : %u\n",
+           (unsigned)header->width);
+    printf("Height      : %u\n",
+           (unsigned)header->height);
+    printf("Bit depth   : %u\n",
+           (unsigned)header->bit_depth);
+    printf("Color type  : %u (%s)\n",
+           (unsigned)header->color_type,
+           png_color_type_name(header->color_type));
+    printf("Compression : %u\n",
+           (unsigned)header->compression_method);
+    printf("Filter      : %u\n",
+           (unsigned)header->filter_method);
+    printf("Interlace   : %u (%s)\n",
+           (unsigned)header->interlace_method,
+           header->interlace_method == 0
+               ? "none"
+               : header->interlace_method == 1
+                   ? "Adam7"
+                   : "invalid");
+    printf("--------------------------------\n\n");
+}
+
+
+static int skip_stream_bytes(
+    FILE *input,
+    uint32_t count
+)
+{
+    unsigned char buffer[4096];
+
+    while (count > 0) {
+
+        size_t amount =
+            count < sizeof(buffer)
+                ? (size_t)count
+                : sizeof(buffer);
+
+        if (fread(buffer, 1, amount, input) != amount) {
+            return 0;
+        }
+
+        count -= (uint32_t)amount;
+    }
+
+    return 1;
+}
+
+
+/*
+ * Stage 3: 走訪 PNG chunk，並解析 IHDR metadata。
+ *
+ * PNG Signature 已經由 detect_image_format() 讀掉，因此此函式
+ * 一進來時，FILE position 正好指向第一個 chunk 的 Length。
+ *
+ * 每個 chunk 固定是：
+ *
+ *     4 bytes  Length
+ *     4 bytes  Type
+ *     N bytes  Data
+ *     4 bytes  CRC
+ *
+ * 本階段新增：
+ *     - IHDR 13-byte metadata parsing
+ *
+ * 還不做：
+ *     - IDAT 保存
+ *     - CRC 驗證
+ *     - zlib inflate
+ */
+static int inspect_png_chunks(
+    FILE *input,
+    PNGHeader *header
+)
+{
+    unsigned int chunk_index = 0;
+    int got_ihdr = 0;
+
+    while (1) {
+        uint32_t length;
+        uint32_t crc;
+        char type[5];
+
+        /* 1. Length */
+        if (!read_u32_be(input, &length)) {
+            fprintf(stderr,
+                    "PNG: failed to read chunk length\n");
+            return 0;
+        }
+
+        if (length > 0x7FFFFFFFU) {
+            fprintf(stderr,
+                    "PNG: invalid chunk length: %u\n",
+                    (unsigned)length);
+            return 0;
+        }
+
+        /* 2. Type */
+        if (fread(type, 1, 4, input) != 4) {
+            fprintf(stderr,
+                    "PNG: failed to read chunk type\n");
+            return 0;
+        }
+
+        type[4] = '\0';
+
+        /*
+         * 3. Data
+         *
+         * Stage 3 只有 IHDR 真的讀入並解析。
+         * 其他 chunk（包含 IDAT）仍然全部跳過。
+         */
+        if (memcmp(type, "IHDR", 4) == 0) {
+
+            unsigned char ihdr_data[13];
+
+            if (got_ihdr) {
+                fprintf(stderr,
+                        "PNG: duplicate IHDR chunk\n");
+                return 0;
+            }
+
+            if (chunk_index != 0) {
+                fprintf(stderr,
+                        "PNG: IHDR must be the first chunk\n");
+                return 0;
+            }
+
+            if (length != sizeof(ihdr_data)) {
+                fprintf(stderr,
+                        "PNG: IHDR length must be 13, got %u\n",
+                        (unsigned)length);
+                return 0;
+            }
+
+            if (fread(
+                    ihdr_data,
+                    1,
+                    sizeof(ihdr_data),
+                    input
+                ) != sizeof(ihdr_data)) {
+
+                fprintf(stderr,
+                        "PNG: truncated IHDR data\n");
+                return 0;
+            }
+
+            if (!parse_png_ihdr(
+                    ihdr_data,
+                    length,
+                    header)) {
+
+                return 0;
+            }
+
+            got_ihdr = 1;
+        }
+        else {
+            if (!skip_stream_bytes(
+                    input,
+                    length)) {
+
+                fprintf(stderr,
+                        "PNG: truncated chunk data for %.4s\n",
+                        type);
+                return 0;
+            }
+        }
+
+        /* 4. CRC -- 目前仍只讀、不驗證 */
+        if (!read_u32_be(input, &crc)) {
+            fprintf(stderr,
+                    "PNG: failed to read CRC for %.4s\n",
+                    type);
+            return 0;
+        }
+
+        printf(
+            "Chunk %u: type=%.4s, length=%u, crc=0x%08X\n",
+            chunk_index,
+            type,
+            (unsigned)length,
+            (unsigned)crc
+        );
+
+        if (memcmp(type, "IHDR", 4) == 0) {
+            print_png_ihdr(header);
+        }
+
+        ++chunk_index;
+
+        if (memcmp(type, "IEND", 4) == 0) {
+            break;
+        }
+    }
+
+    if (!got_ihdr) {
+        fprintf(stderr,
+                "PNG: missing IHDR chunk\n");
+        return 0;
+    }
+
+    return 1;
+}
 
 /*
  * 計算圖片剛好 contain 在 Window 中的倍率。
@@ -415,8 +774,8 @@ int main(int argc, char *argv[])
                 "Usage:\n"
                 "  %s < image.ppm\n"
                 "  %s image.ppm\n"
-                "  %s < image.png    (Stage 1 detection only)\n"
-                "  %s image.png      (Stage 1 detection only)\n",
+                "  %s < image.png    (Stage 3 IHDR inspection)\n"
+                "  %s image.png      (Stage 3 IHDR inspection)\n",
                 argv[0],
                 argv[0],
                 argv[0],
@@ -441,8 +800,20 @@ int main(int argc, char *argv[])
     }
 
     if (format == IMAGE_FORMAT_PNG) {
+        PNGHeader png_header = {0};
+
         printf("PNG detected\n");
-        printf("Stage 1 complete: PNG decoding is not implemented yet.\n");
+        printf("Stage 3: parsing PNG chunks + IHDR metadata...\n\n");
+
+        if (!inspect_png_chunks(
+                input,
+                &png_header)) {
+
+            goto fail_input;
+        }
+
+        printf("Stage 3 complete: IHDR metadata parsed successfully.\n");
+        printf("IDAT image data is still not decoded.\n");
 
         if (should_close_input) {
             fclose(input);
