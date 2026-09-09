@@ -399,6 +399,120 @@ static int inflate_idat_stream(
     return 1;
 }
 
+
+/*
+ * Debug helper: 將 Stage 5 inflate 後的 scanline 原始資料
+ * 輸出成十六進位文字檔。
+ *
+ * 每一列在 filtered buffer 中的格式：
+ *
+ *     [1-byte filter type][row_bytes filtered data]
+ *
+ * 注意：這裡輸出的 row data 還沒有做 PNG unfilter，
+ * 因此 filter type 1~4 時，這些 bytes 不是最終 RGB/RGBA pixel 值。
+ */
+static const char *png_filter_type_name(uint8_t filter_type)
+{
+    switch (filter_type) {
+        case 0: return "None";
+        case 1: return "Sub";
+        case 2: return "Up";
+        case 3: return "Average";
+        case 4: return "Paeth";
+        default: return "Invalid/Unknown";
+    }
+}
+
+static int dump_filtered_scanlines_hex(
+    const PNGHeader *header,
+    const ByteBuffer *filtered,
+    int channels,
+    const char *output_path)
+{
+    const size_t bytes_per_hex_line = 32;
+    size_t row_bytes;
+    size_t scanline_stride;
+    size_t expected_size;
+
+    if (!header || !filtered || !filtered->data || !output_path) {
+        return 0;
+    }
+
+    row_bytes = (size_t)header->width * (size_t)channels;
+    scanline_stride = row_bytes + 1;
+    expected_size = scanline_stride * (size_t)header->height;
+
+    if (filtered->size != expected_size) {
+        fprintf(stderr,
+                "Cannot dump scanlines: expected %zu bytes, got %zu\n",
+                expected_size,
+                filtered->size);
+        return 0;
+    }
+
+    FILE *out = fopen(output_path, "w");
+    if (!out) {
+        fprintf(stderr,
+                "Failed to create scanline dump: %s\n",
+                output_path);
+        return 0;
+    }
+
+    fprintf(out, "PNG Stage 5 filtered scanline dump\n");
+    fprintf(out, "========================================\n");
+    fprintf(out, "Width             : %u\n", (unsigned)header->width);
+    fprintf(out, "Height            : %u\n", (unsigned)header->height);
+    fprintf(out, "Channels          : %d\n", channels);
+    fprintf(out, "Bytes per pixel   : %d\n", channels);
+    fprintf(out, "Row data bytes    : %zu\n", row_bytes);
+    fprintf(out, "Scanline stride   : %zu (1 filter byte + %zu data bytes)\n",
+            scanline_stride,
+            row_bytes);
+    fprintf(out, "Total bytes       : %zu\n", filtered->size);
+    fprintf(out, "========================================\n\n");
+
+    for (uint32_t y = 0; y < header->height; ++y) {
+        const unsigned char *scanline =
+            filtered->data + (size_t)y * scanline_stride;
+
+        uint8_t filter_type = scanline[0];
+        const unsigned char *row_data = scanline + 1;
+
+        fprintf(out, "Scanline %u\n", (unsigned)y);
+        fprintf(out, "Filter type : %u (%s)\n",
+                (unsigned)filter_type,
+                png_filter_type_name(filter_type));
+        fprintf(out, "Filter byte : %02X\n", (unsigned)filter_type);
+        fprintf(out, "Data bytes  : %zu\n", row_bytes);
+        fprintf(out, "Hex data:\n");
+
+        for (size_t i = 0; i < row_bytes; ++i) {
+            if (i % bytes_per_hex_line == 0) {
+                fprintf(out, "%06zX : ", i);
+            }
+
+            fprintf(out, "%02X", (unsigned)row_data[i]);
+
+            if ((i + 1) % bytes_per_hex_line == 0 || i + 1 == row_bytes) {
+                fputc('\n', out);
+            } else {
+                fputc(' ', out);
+            }
+        }
+
+        fputc('\n', out);
+    }
+
+    if (fclose(out) != 0) {
+        fprintf(stderr,
+                "Failed to finish writing scanline dump: %s\n",
+                output_path);
+        return 0;
+    }
+
+    return 1;
+}
+
 static int inspect_png_and_inflate(
     FILE *input,
     PNGHeader *header,
@@ -601,6 +715,27 @@ int main(int argc, char *argv[])
 
         printf("Stage 5 complete: the zlib datastream was inflated successfully.\n");
         printf("The output is still filtered scanlines, not final pixels yet.\n");
+
+        /*
+         * Debug dump:
+         * 把每一個 scanline 的 filter type + 全部 filtered bytes
+         * 輸出成真正的 hexadecimal text data。
+         */
+        if (!dump_filtered_scanlines_hex(
+                &header,
+                &filtered,
+                channels,
+                "scanlines_hex.txt")) {
+
+            fprintf(stderr,
+                    "Failed to write scanlines_hex.txt\n");
+
+            free(idat.data);
+            free(filtered.data);
+            goto fail_input;
+        }
+
+        printf("Scanline hex dump written to: scanlines_hex.txt\n");
         printf("Next step is Stage 6: read each row's filter byte and reconstruct raw RGB/RGBA bytes.\n");
 
         free(idat.data);
