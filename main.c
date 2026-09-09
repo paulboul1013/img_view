@@ -44,6 +44,26 @@ typedef struct {
 
 
 /*
+ * Stage 4: 將所有 IDAT chunk 的 Data 串接成一個連續 buffer。
+ *
+ * PNG 可以有多個 IDAT：
+ *
+ *     IDAT #1 data
+ *     IDAT #2 data
+ *     IDAT #3 data
+ *          |
+ *          v
+ *     one zlib datastream
+ *
+ * Stage 4 只收集 bytes，還不做 zlib inflate。
+ */
+typedef struct {
+    unsigned char *data;
+    size_t size;
+} ByteBuffer;
+
+
+/*
  * Stage 1: 只辨識輸入圖片格式。
  *
  * 為了同時支援：
@@ -277,6 +297,58 @@ static void print_png_ihdr(
 }
 
 
+/*
+ * Stage 4 helper:
+ * 把一段 bytes 接到 ByteBuffer 尾端。
+ *
+ * Before:
+ *     buffer = [A A A]
+ *     data   = [B B]
+ *
+ * After:
+ *     buffer = [A A A B B]
+ */
+static int append_bytes(
+    ByteBuffer *buffer,
+    const unsigned char *data,
+    size_t size
+)
+{
+    if (size == 0) {
+        return 1;
+    }
+
+    /* 防止 size_t overflow。 */
+    if (size > SIZE_MAX - buffer->size) {
+        return 0;
+    }
+
+    size_t new_size =
+        buffer->size + size;
+
+    unsigned char *new_data =
+        realloc(
+            buffer->data,
+            new_size
+        );
+
+    if (!new_data) {
+        return 0;
+    }
+
+    memcpy(
+        new_data + buffer->size,
+        data,
+        size
+    );
+
+    buffer->data = new_data;
+    buffer->size = new_size;
+
+    return 1;
+}
+
+
 static int skip_stream_bytes(
     FILE *input,
     uint32_t count
@@ -303,7 +375,7 @@ static int skip_stream_bytes(
 
 
 /*
- * Stage 3: 走訪 PNG chunk，並解析 IHDR metadata。
+ * Stage 4: 走訪 PNG chunk、解析 IHDR，並收集所有 IDAT Data。
  *
  * PNG Signature 已經由 detect_image_format() 讀掉，因此此函式
  * 一進來時，FILE position 正好指向第一個 chunk 的 Length。
@@ -315,21 +387,26 @@ static int skip_stream_bytes(
  *     N bytes  Data
  *     4 bytes  CRC
  *
- * 本階段新增：
+ * Stage 4 新增：
  *     - IHDR 13-byte metadata parsing
+ *     - 收集所有 IDAT Data，依順序串成一個 ByteBuffer
  *
  * 還不做：
- *     - IDAT 保存
  *     - CRC 驗證
  *     - zlib inflate
  */
 static int inspect_png_chunks(
     FILE *input,
-    PNGHeader *header
+    PNGHeader *header,
+    ByteBuffer *idat,
+    unsigned int *idat_chunk_count
 )
 {
     unsigned int chunk_index = 0;
     int got_ihdr = 0;
+    int got_idat = 0;
+
+    *idat_chunk_count = 0;
 
     while (1) {
         uint32_t length;
@@ -362,8 +439,10 @@ static int inspect_png_chunks(
         /*
          * 3. Data
          *
-         * Stage 3 只有 IHDR 真的讀入並解析。
-         * 其他 chunk（包含 IDAT）仍然全部跳過。
+         * Stage 4：
+         *   IHDR -> 讀入 13 bytes 並解析 metadata
+         *   IDAT -> 讀入 Data，append 到 idat buffer
+         *   其他 -> skip
          */
         if (memcmp(type, "IHDR", 4) == 0) {
 
@@ -410,6 +489,63 @@ static int inspect_png_chunks(
 
             got_ihdr = 1;
         }
+
+        else if (memcmp(type, "IDAT", 4) == 0) {
+
+            if (!got_ihdr) {
+                fprintf(stderr,
+                        "PNG: IDAT appeared before IHDR\n");
+                return 0;
+            }
+
+            unsigned char *chunk_data = NULL;
+
+            if (length > 0) {
+                chunk_data =
+                    malloc((size_t)length);
+
+                if (!chunk_data) {
+                    fprintf(stderr,
+                            "PNG: failed to allocate %u bytes for IDAT\n",
+                            (unsigned)length);
+                    return 0;
+                }
+
+                if (fread(
+                        chunk_data,
+                        1,
+                        (size_t)length,
+                        input
+                    ) != (size_t)length) {
+
+                    fprintf(stderr,
+                            "PNG: truncated IDAT data\n");
+                    free(chunk_data);
+                    return 0;
+                }
+            }
+
+            /*
+             * 關鍵：不是分別保存每個 IDAT，
+             * 而是依檔案順序串成同一個 byte stream。
+             */
+            if (!append_bytes(
+                    idat,
+                    chunk_data,
+                    (size_t)length)) {
+
+                fprintf(stderr,
+                        "PNG: failed to append IDAT data\n");
+                free(chunk_data);
+                return 0;
+            }
+
+            free(chunk_data);
+
+            got_idat = 1;
+            ++(*idat_chunk_count);
+        }
+
         else {
             if (!skip_stream_bytes(
                     input,
@@ -422,7 +558,7 @@ static int inspect_png_chunks(
             }
         }
 
-        /* 4. CRC -- 目前仍只讀、不驗證 */
+        /* 4. CRC -- Stage 4 仍然只讀、不驗證 */
         if (!read_u32_be(input, &crc)) {
             fprintf(stderr,
                     "PNG: failed to read CRC for %.4s\n",
@@ -452,6 +588,12 @@ static int inspect_png_chunks(
     if (!got_ihdr) {
         fprintf(stderr,
                 "PNG: missing IHDR chunk\n");
+        return 0;
+    }
+
+    if (!got_idat) {
+        fprintf(stderr,
+                "PNG: missing IDAT chunk\n");
         return 0;
     }
 
@@ -774,8 +916,8 @@ int main(int argc, char *argv[])
                 "Usage:\n"
                 "  %s < image.ppm\n"
                 "  %s image.ppm\n"
-                "  %s < image.png    (Stage 3 IHDR inspection)\n"
-                "  %s image.png      (Stage 3 IHDR inspection)\n",
+                "  %s < image.png    (Stage 4 IDAT collection)\n"
+                "  %s image.png      (Stage 4 IDAT collection)\n",
                 argv[0],
                 argv[0],
                 argv[0],
@@ -802,18 +944,34 @@ int main(int argc, char *argv[])
     if (format == IMAGE_FORMAT_PNG) {
         PNGHeader png_header = {0};
 
+        ByteBuffer idat = {0};
+        unsigned int idat_chunk_count = 0;
+
         printf("PNG detected\n");
-        printf("Stage 3: parsing PNG chunks + IHDR metadata...\n\n");
+        printf("Stage 4: parsing IHDR + collecting IDAT data...\n\n");
 
         if (!inspect_png_chunks(
                 input,
-                &png_header)) {
+                &png_header,
+                &idat,
+                &idat_chunk_count)) {
 
+            free(idat.data);
             goto fail_input;
         }
 
-        printf("Stage 3 complete: IHDR metadata parsed successfully.\n");
-        printf("IDAT image data is still not decoded.\n");
+        printf("\nStage 4 IDAT summary\n");
+        printf("--------------------------------\n");
+        printf("IDAT chunks collected : %u\n",
+               idat_chunk_count);
+        printf("Compressed size       : %zu bytes\n",
+               idat.size);
+        printf("--------------------------------\n\n");
+
+        printf("Stage 4 complete: all IDAT data was concatenated.\n");
+        printf("The zlib stream is collected but not inflated yet.\n");
+
+        free(idat.data);
 
         if (should_close_input) {
             fclose(input);
