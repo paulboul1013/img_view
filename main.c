@@ -513,6 +513,178 @@ static int dump_filtered_scanlines_hex(
     return 1;
 }
 
+
+
+/*
+ * Stage 6: 統計每個 scanline 使用的 PNG filter type。
+ *
+ * filtered buffer 每一列：
+ *     [filter byte][row_bytes filtered data]
+ */
+typedef struct {
+    size_t count[5];
+    size_t invalid_count;
+} PNGFilterStats;
+
+static int analyze_png_filter_types(
+    const PNGHeader *header,
+    const ByteBuffer *filtered,
+    int channels,
+    PNGFilterStats *stats)
+{
+    size_t row_bytes;
+    size_t stride;
+    size_t expected_size;
+
+    if (!header || !filtered || !filtered->data || !stats) {
+        return 0;
+    }
+
+    memset(stats, 0, sizeof(*stats));
+
+    row_bytes = (size_t)header->width * (size_t)channels;
+    stride = row_bytes + 1;
+    expected_size = stride * (size_t)header->height;
+
+    if (filtered->size != expected_size) {
+        fprintf(stderr,
+                "Stage 6: filtered buffer size mismatch: expected %zu, got %zu\n",
+                expected_size,
+                filtered->size);
+        return 0;
+    }
+
+    for (uint32_t y = 0; y < header->height; ++y) {
+        const unsigned char *scanline =
+            filtered->data + (size_t)y * stride;
+
+        uint8_t filter_type = scanline[0];
+
+        if (filter_type <= 4) {
+            ++stats->count[filter_type];
+        } else {
+            ++stats->invalid_count;
+        }
+    }
+
+    return 1;
+}
+
+static void print_png_filter_stats(
+    const PNGFilterStats *stats)
+{
+    printf("\nStage 6 filter summary\n");
+    printf("--------------------------------\n");
+    printf("Filter 0 None    : %zu rows\n", stats->count[0]);
+    printf("Filter 1 Sub     : %zu rows\n", stats->count[1]);
+    printf("Filter 2 Up      : %zu rows\n", stats->count[2]);
+    printf("Filter 3 Average : %zu rows\n", stats->count[3]);
+    printf("Filter 4 Paeth   : %zu rows\n", stats->count[4]);
+    printf("Invalid filter   : %zu rows\n", stats->invalid_count);
+    printf("--------------------------------\n");
+}
+
+/*
+ * Stage 6: 只實作 Filter Type 0 (None)。
+ *
+ * Filter 0 的定義：filtered byte 就等於原始 byte，
+ * 因此每列只需要跳過最前面的 filter byte，接著 memcpy。
+ *
+ *     filtered:
+ *       [00][R G B A R G B A ...]
+ *             |__________________|
+ *                       |
+ *                    memcpy
+ *                       v
+ *     raw pixels:
+ *           [R G B A R G B A ...]
+ *
+ * 回傳值：
+ *     1  = 全部 scanline 都是 Filter 0，完整還原成功
+ *     2  = 遇到合法但 Stage 6 尚未支援的 Filter 1~4
+ *     0  = 資料格式或記憶體錯誤
+ */
+static int unfilter_none_only(
+    const PNGHeader *header,
+    const ByteBuffer *filtered,
+    int channels,
+    ByteBuffer *raw_pixels,
+    uint32_t *unsupported_row,
+    uint8_t *unsupported_filter)
+{
+    size_t row_bytes;
+    size_t stride;
+    size_t raw_size;
+    unsigned char *raw;
+
+    if (!header || !filtered || !filtered->data || !raw_pixels) {
+        return 0;
+    }
+
+    row_bytes = (size_t)header->width * (size_t)channels;
+    stride = row_bytes + 1;
+
+    if (row_bytes != 0 &&
+        (size_t)header->height > SIZE_MAX / row_bytes) {
+        fprintf(stderr, "Stage 6: raw pixel size overflow\n");
+        return 0;
+    }
+
+    raw_size = row_bytes * (size_t)header->height;
+
+    if (filtered->size != stride * (size_t)header->height) {
+        fprintf(stderr, "Stage 6: invalid filtered buffer size\n");
+        return 0;
+    }
+
+    raw = (unsigned char *)malloc(raw_size);
+    if (!raw) {
+        fprintf(stderr, "Stage 6: failed to allocate raw pixel buffer\n");
+        return 0;
+    }
+
+    for (uint32_t y = 0; y < header->height; ++y) {
+        const unsigned char *scanline =
+            filtered->data + (size_t)y * stride;
+
+        uint8_t filter_type = scanline[0];
+        const unsigned char *filtered_row = scanline + 1;
+        unsigned char *raw_row = raw + (size_t)y * row_bytes;
+
+        if (filter_type != 0) {
+            if (filter_type > 4) {
+                fprintf(stderr,
+                        "Stage 6: invalid filter type %u at scanline %u\n",
+                        (unsigned)filter_type,
+                        (unsigned)y);
+                free(raw);
+                return 0;
+            }
+
+            if (unsupported_row) {
+                *unsupported_row = y;
+            }
+
+            if (unsupported_filter) {
+                *unsupported_filter = filter_type;
+            }
+
+            free(raw);
+            return 2;
+        }
+
+        /*
+         * Filter 0 = None：沒有 predictor，也沒有加減運算。
+         * 解壓後的 row bytes 本身就是最終 raw pixel bytes。
+         */
+        memcpy(raw_row, filtered_row, row_bytes);
+    }
+
+    raw_pixels->data = raw;
+    raw_pixels->size = raw_size;
+    return 1;
+}
+
 static int inspect_png_and_inflate(
     FILE *input,
     PNGHeader *header,
@@ -679,7 +851,7 @@ int main(int argc, char *argv[])
         size_t expected_filtered_size;
 
         printf("PNG detected\n");
-        printf("Stage 5: parsing IHDR + collecting IDAT + inflating zlib stream...\n\n");
+        printf("Stage 6: Stage 5 inflate + Filter 0 (None) reconstruction...\n\n");
 
         if (!inspect_png_and_inflate(
                 input,
@@ -736,8 +908,77 @@ int main(int argc, char *argv[])
         }
 
         printf("Scanline hex dump written to: scanlines_hex.txt\n");
-        printf("Next step is Stage 6: read each row's filter byte and reconstruct raw RGB/RGBA bytes.\n");
 
+        /*
+         * Stage 6.1: 先統計整張 PNG 實際使用哪些 filter。
+         */
+        PNGFilterStats filter_stats;
+
+        if (!analyze_png_filter_types(
+                &header,
+                &filtered,
+                channels,
+                &filter_stats)) {
+
+            free(idat.data);
+            free(filtered.data);
+            goto fail_input;
+        }
+
+        print_png_filter_stats(&filter_stats);
+
+        /*
+         * Stage 6.2: 只實作 Filter 0 (None)。
+         */
+        ByteBuffer raw_pixels = {0};
+        uint32_t unsupported_row = 0;
+        uint8_t unsupported_filter = 0;
+
+        int stage6_result =
+            unfilter_none_only(
+                &header,
+                &filtered,
+                channels,
+                &raw_pixels,
+                &unsupported_row,
+                &unsupported_filter);
+
+        if (stage6_result == 1) {
+            size_t expected_raw_size =
+                (size_t)header.width *
+                (size_t)header.height *
+                (size_t)channels;
+
+            printf("\nStage 6 reconstruction summary\n");
+            printf("--------------------------------\n");
+            printf("Supported filter       : 0 (None)\n");
+            printf("Expected raw size      : %zu bytes\n", expected_raw_size);
+            printf("Reconstructed raw size : %zu bytes\n", raw_pixels.size);
+            printf("--------------------------------\n\n");
+
+            printf("Stage 6 complete: every scanline used Filter 0.\n");
+            printf("Raw RGB/RGBA pixel bytes are now reconstructed.\n");
+            printf("Next Stage 7 will add Filter 1 (Sub).\n");
+        }
+        else if (stage6_result == 2) {
+            printf("\nStage 6 stopped at scanline %u.\n",
+                   (unsigned)unsupported_row);
+            printf("That scanline uses Filter %u (%s).\n",
+                   (unsigned)unsupported_filter,
+                   png_filter_type_name(unsupported_filter));
+            printf("Stage 6 currently implements only Filter 0 (None).\n");
+            printf("This is expected for normal PNG files that mix filter types.\n");
+            printf("Next Stage 7 will implement Filter 1 (Sub).\n");
+        }
+        else {
+            fprintf(stderr, "Stage 6 reconstruction failed\n");
+            free(idat.data);
+            free(filtered.data);
+            free(raw_pixels.data);
+            goto fail_input;
+        }
+
+        free(raw_pixels.data);
         free(idat.data);
         free(filtered.data);
 
